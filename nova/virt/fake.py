@@ -46,6 +46,7 @@ from nova.objects import migrate_data
 from nova.virt import driver
 from nova.virt import hardware
 from nova.virt import virtapi
+from nova import utils
 
 CONF = nova.conf.CONF
 
@@ -75,6 +76,16 @@ def restore_nodes():
     """
     global _FAKE_NODES
     _FAKE_NODES = [CONF.host]
+
+
+def _ovs_vsctl(args):
+    full_args = ['ovs-vsctl', '--timeout=%s' % CONF.ovs_vsctl_timeout] + args
+    try:
+        return utils.execute(*full_args, run_as_root=True)
+    except Exception as e:
+        LOG.error("Unable to execute %(cmd)s. Exception: %(exception)s",
+                  {'cmd': full_args, 'exception': e})
+        raise exception.OvsConfigurationFailure(inner_exception=e)
 
 
 class FakeInstance(object):
@@ -183,17 +194,47 @@ class FakeDriver(driver.ComputeDriver):
     def list_instance_uuids(self):
         return list(self.instances.keys())
 
+    def plug_vif(self, instance, vif):
+        bridge = 'br-int'
+        dev = vif.get('devname')
+        port = vif.get('id')
+        mac_address = vif.get('address')
+        if not dev or not port or not mac_address:
+            return
+        else:
+            _ovs_vsctl(['--', '--may-exist', 'add-port', bridge, dev,
+                        '--', 'set', 'Interface', dev, 'type=internal',
+                        '--', 'set', 'Interface', dev,
+                        'external-ids:iface-id=%s' % port,
+                        '--', 'set', 'Interface', dev,
+                        'external-ids:iface-status=active',
+                        '--', 'set', 'Interface', dev,
+                        'external-ids:attached-mac=%s' % mac_address])
+
     def plug_vifs(self, instance, network_info):
         """Plug VIFs into networks."""
-        pass
+        for vif in network_info:
+            self.plug_vif(instance, vif)
+
+    def unplug_vif(self, instance, vif):
+        bridge = 'br-int'
+        dev = vif.get('devname')
+        port = vif.get('id')
+        if not dev:
+            if not port:
+                return
+            dev = 'tap' + str(port[0:11])
+        _ovs_vsctl(['--', '--if-exists', 'del-port', bridge, dev])
 
     def unplug_vifs(self, instance, network_info):
         """Unplug VIFs from networks."""
-        pass
+        for vif in network_info:
+            self.unplug_vif(instance, vif)
 
     def spawn(self, context, instance, image_meta, injected_files,
               admin_password, allocations, network_info=None,
               block_device_info=None):
+        self.plug_vifs(instance, network_info)
 
         if network_info:
             for vif in network_info:
@@ -299,6 +340,7 @@ class FakeDriver(driver.ComputeDriver):
 
     def destroy(self, context, instance, network_info, block_device_info=None,
                 destroy_disks=True):
+        self.unplug_vifs(instance, network_info)
         key = instance.uuid
         if key in self.instances:
             flavor = instance.flavor
